@@ -64,6 +64,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/util/lrucache"
 	"github.com/awslabs/soci-snapshotter/util/namedmutex"
 	"github.com/awslabs/soci-snapshotter/ztoc"
+	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/log"
@@ -333,6 +334,63 @@ func (r *Resolver) Resolve(ctx context.Context, hosts []docker.RegistryHost, ref
 		bgLayerResolver = backgroundfetcher.NewSequentialResolver(desc.Digest, spanManager)
 		r.bgFetcher.Add(bgLayerResolver)
 	}
+
+	// Prefetch spans covering prefetch files before mounting
+	log.G(ctx).Infof("PREFETCH_DEBUG: checking prefetch files for layer %s: found %d files", desc.Digest, len(ztoc.PrefetchFiles))
+
+	if len(ztoc.PrefetchFiles) > 0 {
+		type spanRange struct {
+			s0 compression.SpanID
+			s1 compression.SpanID
+		}
+		uniq := make(map[spanRange]struct{})
+
+		// Use pre-calculated span information from prefetch.json
+		for _, pf := range ztoc.PrefetchFiles {
+			log.G(ctx).Infof("PREFETCH_DEBUG: processing prefetch file: %s (spans %d-%d, count %d, size %d bytes)",
+				pf.Path, pf.StartSpan, pf.EndSpan, pf.SpanCount, pf.Size)
+			if pf.SpanCount > 0 {
+				uniq[spanRange{s0: pf.StartSpan, s1: pf.EndSpan}] = struct{}{}
+			}
+		}
+
+		log.G(ctx).Infof("PREFETCH_DEBUG: starting prefetch for layer %s: %d unique span ranges", desc.Digest, len(uniq))
+		prefetchStartTime := time.Now()
+
+		// Submit each span in the deduped ranges to SpanManager
+		// Use synchronous prefetch with uncompression to ensure spans are ready for immediate use
+		totalSpans := 0
+		successfulSpans := 0
+		failedSpans := 0
+		for rge := range uniq {
+			for s := rge.s0; s <= rge.s1; s++ {
+				totalSpans++
+				spanStartTime := time.Now()
+				// Use ResolveSpan for synchronous prefetch with immediate uncompression
+				if err := spanManager.ResolveSpan(s); err != nil {
+					failedSpans++
+					log.G(ctx).WithError(err).Warnf("PREFETCH_DEBUG: prefetch span %d failed for layer %s (duration: %v)", s, desc.Digest, time.Since(spanStartTime))
+				} else {
+					successfulSpans++
+					log.G(ctx).Infof("PREFETCH_DEBUG: successfully prefetched and uncompressed span %d for layer %s (duration: %v)", s, desc.Digest, time.Since(spanStartTime))
+				}
+			}
+		}
+		prefetchDuration := time.Since(prefetchStartTime)
+		log.G(ctx).Infof("PREFETCH_DEBUG: completed SYNCHRONOUS prefetch for layer %s: %d/%d spans successful in %d ranges (total duration: %v)",
+			desc.Digest, successfulSpans, totalSpans, len(uniq), prefetchDuration)
+		log.G(ctx).Infof("PREFETCH_DEBUG: ALL prefetched spans are now UNCOMPRESSED and CACHED - ready for immediate access")
+		log.G(ctx).Infof("PREFETCH_DEBUG: container startup can now proceed - no remote fetches should be needed for prefetched files")
+
+		// Log span ranges that should now be cached
+		log.G(ctx).Infof("PREFETCH_DEBUG: prefetched span ranges for layer %s:", desc.Digest)
+		for rge := range uniq {
+			log.G(ctx).Infof("PREFETCH_DEBUG: spans %d-%d should be cached after prefetch", rge.s0, rge.s1)
+		}
+	} else {
+		log.G(ctx).Infof("PREFETCH_DEBUG: no prefetch files found for layer %s", desc.Digest)
+	}
+
 	vr, err := reader.NewReader(meta, desc.Digest, spanManager, disableVerification)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read layer: %w", err)

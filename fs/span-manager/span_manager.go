@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"time"
 
 	"github.com/awslabs/soci-snapshotter/cache"
 	"github.com/awslabs/soci-snapshotter/util/ioutils"
@@ -30,6 +31,7 @@ import (
 	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/containerd/log"
 	"github.com/opencontainers/go-digest"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -147,6 +149,162 @@ func (m *SpanManager) FetchSingleSpan(spanID compression.SpanID) error {
 	return err
 }
 
+// FetchAndUncompressSpan fetches and uncompresses a span synchronously for prefetch.
+// This ensures the span is immediately available in uncompressed form for file access.
+// span state change: unrequested -> requested -> uncompressed.
+func (m *SpanManager) FetchAndUncompressSpan(spanID compression.SpanID) error {
+	if spanID > m.ztoc.MaxSpanID {
+		return ErrExceedMaxSpan
+	}
+
+	// return directly if span is already uncompressed or being processed
+	s := m.spans[spanID]
+	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Debug("PREFETCH_DEBUG: span already uncompressed, skipping")
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// check again after acquiring lock
+	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Debug("PREFETCH_DEBUG: span already uncompressed after lock, skipping")
+		return nil
+	}
+
+	// If span is in unrequested state, fetch and uncompress it
+	if s.checkState(unrequested) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: fetching and uncompressing span for prefetch")
+
+		_, err := m.fetchAndCacheSpan(spanID, true) // true = uncompress
+		if err != nil {
+			log.L.WithFields(logrus.Fields{
+				"spanID": spanID,
+				"error":  err,
+			}).Error("PREFETCH_DEBUG: failed to fetch and uncompress span for prefetch")
+			return err
+		}
+
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: successfully prefetched span in uncompressed state")
+		return nil
+	}
+
+	// If span is in fetched state (compressed), uncompress it
+	if s.checkState(fetched) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: span already fetched, uncompressing for prefetch")
+
+		// get compressed span from the cache
+		compressedSize := s.endCompOffset - s.startCompOffset
+		r, err := m.getSpanFromCache(s.id, 0, compressedSize)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+
+		// read compressed span
+		compressedBuf, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+
+		// uncompress span
+		uncompSpanBuf, err := m.uncompressSpan(s, compressedBuf)
+		if err != nil {
+			return err
+		}
+
+		// cache uncompressed span
+		if err := m.addSpanToCache(s.id, uncompSpanBuf); err != nil {
+			return err
+		}
+		if err := s.setState(uncompressed); err != nil {
+			return err
+		}
+
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: successfully uncompressed fetched span for prefetch")
+		return nil
+	}
+
+	// If span is in requested state, wait for it to complete
+	// This shouldn't happen in normal prefetch flow, but handle it gracefully
+	log.L.WithFields(logrus.Fields{
+		"spanID":    spanID,
+		"spanState": s.state,
+	}).Warn("PREFETCH_DEBUG: span in unexpected state during prefetch, skipping")
+
+	return nil
+}
+
+// ResolveSpan ensures the span exists in cache and is uncompressed by using
+// a safer approach that directly fetches and caches the span without calling getSpanContent.
+func (m *SpanManager) ResolveSpan(spanID compression.SpanID) error {
+	log.L.WithFields(logrus.Fields{
+		"spanID": spanID,
+	}).Info("PREFETCH_DEBUG: ResolveSpan called - ensuring span is uncompressed and cached")
+
+	if spanID > m.ztoc.MaxSpanID {
+		return ErrExceedMaxSpan
+	}
+
+	s := m.spans[spanID]
+
+	// Check if span is already uncompressed
+	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Debug("PREFETCH_DEBUG: span already uncompressed, skipping")
+		return nil
+	}
+
+	// Use fetchAndCacheSpan directly to ensure proper span handling
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check again after acquiring lock
+	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Debug("PREFETCH_DEBUG: span already uncompressed after lock, skipping")
+		return nil
+	}
+
+	log.L.WithFields(logrus.Fields{
+		"spanID":      spanID,
+		"startUncomp": s.startUncompOffset,
+		"endUncomp":   s.endUncompOffset,
+		"startComp":   s.startCompOffset,
+		"endComp":     s.endCompOffset,
+	}).Info("PREFETCH_DEBUG: fetching and uncompressing span for prefetch")
+
+	// Directly fetch and uncompress the span
+	_, err := m.fetchAndCacheSpan(spanID, true) // true = uncompress
+	if err != nil {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+			"error":  err,
+		}).Error("PREFETCH_DEBUG: failed to fetch and uncompress span for prefetch")
+		return err
+	}
+
+	log.L.WithFields(logrus.Fields{
+		"spanID": spanID,
+	}).Info("PREFETCH_DEBUG: successfully resolved span - now cached and uncompressed")
+	return nil
+}
+
 // resolveSpan ensures the span exists in cache and is uncompressed by calling
 // `getSpanContent`. Only for testing.
 func (m *SpanManager) resolveSpan(spanID compression.SpanID) error {
@@ -154,9 +312,8 @@ func (m *SpanManager) resolveSpan(spanID compression.SpanID) error {
 		return ErrExceedMaxSpan
 	}
 
-	// this func itself doesn't use the returned span data
-	_, err := m.getSpanContent(spanID, 0, m.spans[spanID].endUncompOffset)
-	return err
+	// Use the safer ResolveSpan method instead of direct getSpanContent call
+	return m.ResolveSpan(spanID)
 }
 
 // GetContents returns a reader for the requested contents. The contents may be
@@ -235,8 +392,19 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 	s := m.spans[spanID]
 	size := offsetEnd - offsetStart
 
+	log.L.WithFields(logrus.Fields{
+		"spanID":      spanID,
+		"offsetStart": offsetStart,
+		"offsetEnd":   offsetEnd,
+		"size":        size,
+		"spanState":   s.state,
+	}).Info("PREFETCH_DEBUG: getSpanContent called - checking cache status")
+
 	// return from cache directly if cached and uncompressed
 	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: span found in cache as uncompressed - cache HIT!")
 		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
@@ -244,11 +412,17 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 	defer s.mu.Unlock()
 	// check again after acquiring lock
 	if s.checkState(uncompressed) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: span found in cache as uncompressed after lock - cache HIT!")
 		return m.getSpanFromCache(s.id, offsetStart, size)
 	}
 
 	// if cached but not uncompressed, uncompress and cache the span content
 	if s.checkState(fetched) {
+		log.L.WithFields(logrus.Fields{
+			"spanID": spanID,
+		}).Info("PREFETCH_DEBUG: span found in cache as compressed - will uncompress")
 		// get compressed span from the cache
 		compressedSize := s.endCompOffset - s.startCompOffset
 		r, err := m.getSpanFromCache(s.id, 0, compressedSize)
@@ -281,6 +455,12 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 
 	// fetch-uncompress-cache span: span state can only be `unrequested` since
 	// no goroutine will release span state lock in `requested` state
+	log.L.WithFields(logrus.Fields{
+		"spanID":    spanID,
+		"spanState": s.state,
+		"reason":    "cache_miss_need_remote_fetch",
+	}).Warn("PREFETCH_DEBUG: cache MISS - span not found in cache, fetching from remote")
+
 	uncompBuf, err := m.fetchAndCacheSpan(s.id, true)
 	if err != nil {
 		return nil, err
@@ -296,6 +476,15 @@ func (m *SpanManager) getSpanContent(spanID compression.SpanID, offsetStart, off
 // span's state lock before calling.
 func (m *SpanManager) fetchAndCacheSpan(spanID compression.SpanID, uncompress bool) (buf []byte, err error) {
 	s := m.spans[spanID]
+	log.L.WithFields(logrus.Fields{
+		"spanID":      spanID,
+		"uncompress":  uncompress,
+		"spanState":   s.state,
+		"startComp":   s.startCompOffset,
+		"endComp":     s.endCompOffset,
+		"startUncomp": s.startUncompOffset,
+		"endUncomp":   s.endUncompOffset,
+	}).Info("PREFETCH_DEBUG: fetchAndCacheSpan called - checking if span was prefetched")
 
 	// change to `requested`; if fetch/cache fails, change back to `unrequested`
 	// so other goroutines can request again.
@@ -347,12 +536,28 @@ func (m *SpanManager) fetchSpanWithRetries(spanID compression.SpanID) ([]byte, e
 	compressedSize := s.endCompOffset - s.startCompOffset
 	compressedBuf := make([]byte, compressedSize)
 
+	log.L.WithFields(logrus.Fields{
+		"spanID": spanID,
+		"offset": offset,
+		"size":   compressedSize,
+	}).Debug("PREFETCH_DEBUG: Starting to fetch span from remote")
+
 	var (
 		err error
 		n   int
 	)
 	for i := 0; i < m.maxSpanVerificationFailureRetries+1; i++ {
+		start := time.Now()
 		n, err = m.r.ReadAt(compressedBuf, int64(offset))
+		fetchDuration := time.Since(start)
+
+		log.L.WithFields(logrus.Fields{
+			"spanID":       spanID,
+			"attempt":      i + 1,
+			"bytesRead":    n,
+			"expectedSize": compressedSize,
+			"duration_ms":  fetchDuration.Milliseconds(),
+		}).Debug("PREFETCH_DEBUG: Remote span fetch attempt completed")
 		// if the n = len(p) bytes returned by ReadAt are at the end of the input source,
 		// ReadAt may return either err == EOF or err == nil: https://pkg.go.dev/io#ReaderAt
 		if err != nil && err != io.EOF {
@@ -364,9 +569,25 @@ func (m *SpanManager) fetchSpanWithRetries(spanID compression.SpanID) ([]byte, e
 		}
 
 		if err = m.verifySpanContents(compressedBuf, spanID); err == nil {
+			log.L.WithFields(logrus.Fields{
+				"spanID":    spanID,
+				"finalSize": len(compressedBuf),
+				"attempts":  i + 1,
+			}).Info("PREFETCH_DEBUG: Successfully fetched and verified span from remote")
 			return compressedBuf, nil
 		}
+
+		log.L.WithFields(logrus.Fields{
+			"spanID":  spanID,
+			"attempt": i + 1,
+			"error":   err,
+		}).Warn("PREFETCH_DEBUG: Span verification failed, will retry")
 	}
+
+	log.L.WithFields(logrus.Fields{
+		"spanID":     spanID,
+		"finalError": err,
+	}).Error("PREFETCH_DEBUG: Failed to fetch span from remote after all retries")
 	return []byte{}, err
 }
 

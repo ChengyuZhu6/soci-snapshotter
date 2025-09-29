@@ -63,6 +63,11 @@ type PrefetchFileInfo struct {
 	Path   string `json:"path"`   // file path
 	Size   int64  `json:"size"`   // file size (bytes)
 	Offset int64  `json:"offset"` // file offset in the layer (bytes)
+
+	// Span information for compressed data
+	StartSpan compression.SpanID `json:"start_span"` // first span ID covering this file
+	EndSpan   compression.SpanID `json:"end_span"`   // last span ID covering this file
+	SpanCount int                `json:"span_count"` // number of spans covering this file
 }
 
 // CompressionInfo is the "zinfo" part of ztoc including the `Checkpoints` data

@@ -533,12 +533,12 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 				continue
 			}
 
-			fmt.Printf("DEBUG: Scanning layer %s (size: %d bytes, media type: %s)\n", layer.Digest, layer.Size, layer.MediaType)
+			fmt.Printf("PREFETCH_DEBUG: Scanning layer %s (size: %d bytes, media type: %s)\n", layer.Digest, layer.Size, layer.MediaType)
 			var layerPrefetchFiles []ztoc.PrefetchFileInfo
 			for _, prefetchPath := range b.config.prefetchPaths {
 				// if the file is already found in the upper layer, skip
 				if foundPrefetchFiles[prefetchPath] {
-					fmt.Printf("DEBUG: Skipping %s (already found in upper layer)\n", prefetchPath)
+					fmt.Printf("PREFETCH_DEBUG: Skipping %s (already found in upper layer)\n", prefetchPath)
 					continue
 				}
 
@@ -550,15 +550,15 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 						Offset: offset,
 					})
 					foundPrefetchFiles[prefetchPath] = true
-					fmt.Printf("✓ Found prefetch file %s (size: %d bytes, offset: %d) in layer %s\n", prefetchPath, size, offset, layer.Digest)
+					fmt.Printf("PREFETCH_DEBUG: ✓ Found prefetch file %s (size: %d bytes, offset: %d) in layer %s\n", prefetchPath, size, offset, layer.Digest)
 				} else {
-					fmt.Printf("✗ File %s not found in layer %s\n", prefetchPath, layer.Digest)
+					fmt.Printf("PREFETCH_DEBUG: ✗ File %s not found in layer %s\n", prefetchPath, layer.Digest)
 				}
 			}
 
 			if len(layerPrefetchFiles) > 0 {
 				layerPrefetchMap[layer.Digest.String()] = layerPrefetchFiles
-				fmt.Printf("DEBUG: Added %d prefetch files to layer %s\n", len(layerPrefetchFiles), layer.Digest)
+				fmt.Printf("PREFETCH_DEBUG: Added %d prefetch files to layer %s\n", len(layerPrefetchFiles), layer.Digest)
 			}
 		}
 	}
@@ -930,7 +930,7 @@ func (b *IndexBuilder) buildSociLayerWithPrefetch(ctx context.Context, desc ocis
 	return &ztocDesc, err
 }
 
-// extractPrefetchFileContents extracts the actual content of prefetch files and updates their offsets
+// extractPrefetchFileContents extracts compressed span data for prefetch files
 func (b *IndexBuilder) extractPrefetchFileContents(layerPath string, prefetchFiles []ztoc.PrefetchFileInfo, toc *ztoc.Ztoc) ([]ztoc.PrefetchFileInfo, error) {
 	if len(prefetchFiles) == 0 {
 		return nil, nil
@@ -948,38 +948,82 @@ func (b *IndexBuilder) extractPrefetchFileContents(layerPath string, prefetchFil
 	}
 	sr := io.NewSectionReader(file, 0, fileInfo.Size())
 
+	// Get zinfo for span calculations
+	gz, err := toc.Zinfo()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get zinfo: %w", err)
+	}
+	defer gz.Close()
+
 	var updatedFiles []ztoc.PrefetchFileInfo
-	var fileContents [][]byte
+	var spanContents [][]byte
+
+	// Track unique spans to avoid duplication
+	spanMap := make(map[compression.SpanID][]byte)
 
 	for _, prefetchFile := range prefetchFiles {
-		fmt.Printf("Extracting prefetch file: %s (size: %d, offset: %d)\n",
+		fmt.Printf("Extracting compressed spans for prefetch file: %s (size: %d, offset: %d)\n",
 			prefetchFile.Path, prefetchFile.Size, prefetchFile.Offset)
 
-		content, err := toc.ExtractFile(sr, prefetchFile.Path)
-		if err != nil {
-			fmt.Printf("Warning: failed to extract prefetch file %s: %v\n", prefetchFile.Path, err)
-			continue
+		// Calculate span range for this file
+		startSpan := gz.UncompressedOffsetToSpanID(compression.Offset(prefetchFile.Offset))
+		endSpan := gz.UncompressedOffsetToSpanID(compression.Offset(prefetchFile.Offset + prefetchFile.Size))
+		if endSpan < startSpan {
+			endSpan = startSpan
 		}
 
-		if int64(len(content)) != prefetchFile.Size {
-			fmt.Printf("Warning: size mismatch for file %s: expected %d, got %d\n",
-				prefetchFile.Path, prefetchFile.Size, len(content))
+		fmt.Printf("File %s spans from %d to %d\n", prefetchFile.Path, startSpan, endSpan)
+
+		// Extract compressed data for each span
+		var fileSpanData []byte
+		for spanID := startSpan; spanID <= endSpan; spanID++ {
+			if spanData, exists := spanMap[spanID]; exists {
+				// Reuse already extracted span data
+				fileSpanData = append(fileSpanData, spanData...)
+				continue
+			}
+
+			// Get span compressed offset range
+			startOffset := gz.StartCompressedOffset(spanID)
+			endOffset := gz.EndCompressedOffset(spanID, compression.Offset(fileInfo.Size()))
+			spanSize := int64(endOffset - startOffset)
+
+			if spanSize <= 0 {
+				fmt.Printf("Warning: invalid span size %d for span %d\n", spanSize, spanID)
+				continue
+			}
+
+			// Read compressed span data from layer
+			spanData := make([]byte, spanSize)
+			_, err = sr.ReadAt(spanData, int64(startOffset))
+			if err != nil {
+				fmt.Printf("Warning: failed to read span %d data: %v\n", spanID, err)
+				continue
+			}
+
+			spanMap[spanID] = spanData
+			fileSpanData = append(fileSpanData, spanData...)
 		}
 
-		fileContents = append(fileContents, content)
-		updatedFiles = append(updatedFiles, ztoc.PrefetchFileInfo{
-			Path:   prefetchFile.Path,
-			Size:   int64(len(content)),
-			Offset: prefetchFile.Offset,
-		})
+		if len(fileSpanData) > 0 {
+			spanContents = append(spanContents, fileSpanData)
+			updatedFiles = append(updatedFiles, ztoc.PrefetchFileInfo{
+				Path:      prefetchFile.Path,
+				Size:      prefetchFile.Size,
+				Offset:    prefetchFile.Offset,
+				StartSpan: startSpan,
+				EndSpan:   endSpan,
+				SpanCount: int(endSpan - startSpan + 1),
+			})
 
-		fmt.Printf("✓ Successfully extracted prefetch file %s: %d bytes\n",
-			prefetchFile.Path, len(content))
+			fmt.Printf("✓ Successfully extracted %d bytes of compressed span data for file %s (spans %d-%d)\n",
+				len(fileSpanData), prefetchFile.Path, startSpan, endSpan)
+		}
 	}
 
-	toc.PrefetchFileContents = fileContents
+	toc.PrefetchFileContents = spanContents
 
-	fmt.Printf("Successfully extracted %d prefetch files with total content\n", len(updatedFiles))
+	fmt.Printf("Successfully extracted compressed span data for %d prefetch files\n", len(updatedFiles))
 	return updatedFiles, nil
 }
 

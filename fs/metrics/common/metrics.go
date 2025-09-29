@@ -122,6 +122,13 @@ const (
 
 	// Number of items in the work queue of background fetcher
 	BackgroundFetchWorkQueueSize = "background_fetch_work_queue_size"
+
+	// Prefetch debugging metrics
+	PrefetchRemoteFetchCount     = "prefetch_remote_fetch_count"
+	PrefetchRemoteFetchDuration  = "prefetch_remote_fetch_duration"
+	PrefetchRemoteFetchBytes     = "prefetch_remote_fetch_bytes"
+	PrefetchSpanFetchAttempts    = "prefetch_span_fetch_attempts"
+	PrefetchSpanFetchSuccessRate = "prefetch_span_fetch_success_rate"
 )
 
 var (

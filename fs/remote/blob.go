@@ -197,9 +197,15 @@ func (b *blob) ReadAt(p []byte, offset int64, opts ...Option) (int, error) {
 	w := newBytesWriter(p, 0)
 
 	// Read required data
+	start := time.Now()
 	if err := b.fetchRange(reg, w, &readAtOpts); err != nil {
 		return 0, err
 	}
+	fetchDuration := time.Since(start)
+
+	// Log remote fetch details for debugging
+	fmt.Printf("PREFETCH_DEBUG: Remote blob ReadAt - offset: %d, size: %d, duration: %v\n",
+		offset, len(p), fetchDuration)
 
 	// Adjust the buffer size according to the blob size
 	if remain := b.size - offset; int64(len(p)) >= remain {
@@ -223,11 +229,17 @@ func (b *blob) fetchRegion(reg region, w io.Writer, fetched bool, opts *options)
 
 	fetchCtx := context.Background()
 
+	fmt.Printf("PREFETCH_DEBUG: Starting remote fetch for region [%d-%d] (size: %d bytes)\n",
+		reg.b, reg.e, reg.size())
+
 	var req []region
 	req = append(req, reg)
+	fetchStart := time.Now()
 	mr, err := fr.fetch(fetchCtx, req, true)
 
 	if err != nil {
+		fmt.Printf("PREFETCH_DEBUG: Remote fetch failed for region [%d-%d]: %v\n",
+			reg.b, reg.e, err)
 		return err
 	}
 	defer mr.Close()
@@ -237,6 +249,7 @@ func (b *blob) fetchRegion(reg region, w io.Writer, fetched bool, opts *options)
 	b.lastCheck = time.Now()
 	b.lastCheckMu.Unlock()
 
+	bytesWritten := int64(0)
 	for {
 		_, p, err := mr.Next()
 		if err == io.EOF {
@@ -245,15 +258,21 @@ func (b *blob) fetchRegion(reg region, w io.Writer, fetched bool, opts *options)
 			return fmt.Errorf("failed to read multipart resp: %w", err)
 		}
 
-		if _, err := io.CopyN(w, p, reg.size()); err != nil {
+		n, err := io.CopyN(w, p, reg.size())
+		if err != nil {
 			return err
 		}
+		bytesWritten += n
 
 		b.fetchedRegionSetMu.Lock()
 		b.fetchedRegionSet.add(reg)
 		b.fetchedRegionSetMu.Unlock()
 		fetched = true
 	}
+
+	fetchDuration := time.Since(fetchStart)
+	fmt.Printf("PREFETCH_DEBUG: Successfully fetched region [%d-%d] from remote: %d bytes in %v\n",
+		reg.b, reg.e, bytesWritten, fetchDuration)
 
 	if !fetched {
 		return fmt.Errorf("failed to fetch region %v", reg)
