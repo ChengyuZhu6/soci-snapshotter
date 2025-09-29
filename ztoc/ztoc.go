@@ -19,9 +19,11 @@ package ztoc
 import (
 	"archive/tar"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -53,7 +55,8 @@ type Ztoc struct {
 	CompressedArchiveSize   compression.Offset
 	UncompressedArchiveSize compression.Offset
 
-	PrefetchFiles []PrefetchFileInfo `json:"prefetchFiles,omitempty"`
+	PrefetchFiles        []PrefetchFileInfo `json:"prefetchFiles,omitempty"`
+	PrefetchFileContents [][]byte           `json:"-"` // 不序列化到 JSON，仅用于内部处理
 }
 
 type PrefetchFileInfo struct {
@@ -278,4 +281,77 @@ func (zt Ztoc) GetPrefetchFile(path string) (*PrefetchFileInfo, bool) {
 		}
 	}
 	return nil, false
+}
+
+// PrefetchMetadata represents the metadata for prefetch files
+type PrefetchMetadata struct {
+	LayerDigest   string             `json:"layer_digest"`
+	PrefetchFiles []PrefetchFileInfo `json:"prefetch_files"`
+	CreatedAt     time.Time          `json:"created_at"`
+	Version       string             `json:"version"`
+}
+
+// MarshalPrefetchFiles serializes prefetch files information to JSON
+func (zt *Ztoc) MarshalPrefetchFiles(layerDigest string) ([]byte, error) {
+	if len(zt.PrefetchFiles) == 0 {
+		return nil, nil
+	}
+
+	metadata := PrefetchMetadata{
+		LayerDigest:   layerDigest,
+		PrefetchFiles: zt.PrefetchFiles,
+		CreatedAt:     time.Now(),
+		Version:       "1.0",
+	}
+
+	return json.Marshal(metadata)
+}
+
+// UnmarshalPrefetchFiles deserializes prefetch files information from JSON
+func (zt *Ztoc) UnmarshalPrefetchFiles(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var metadata PrefetchMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return err
+	}
+
+	zt.PrefetchFiles = metadata.PrefetchFiles
+	return nil
+}
+
+// SavePrefetchMetadata saves prefetch files information to a separate file
+func SavePrefetchMetadata(ztocPath string, zt *Ztoc, layerDigest string) error {
+	if len(zt.PrefetchFiles) == 0 {
+		return nil
+	}
+
+	prefetchPath := ztocPath + ".prefetch"
+	data, err := zt.MarshalPrefetchFiles(layerDigest)
+	if err != nil {
+		return err
+	}
+
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(filepath.Dir(prefetchPath), 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(prefetchPath, data, 0644)
+}
+
+// LoadPrefetchMetadata loads prefetch files information from a separate file
+func LoadPrefetchMetadata(ztocPath string, zt *Ztoc) error {
+	prefetchPath := ztocPath + ".prefetch"
+	data, err := os.ReadFile(prefetchPath)
+	if os.IsNotExist(err) {
+		return nil // No prefetch file information, normal case
+	}
+	if err != nil {
+		return err
+	}
+
+	return zt.UnmarshalPrefetchFiles(data)
 }

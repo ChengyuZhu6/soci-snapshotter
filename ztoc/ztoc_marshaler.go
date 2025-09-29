@@ -18,6 +18,7 @@ package ztoc
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,7 +60,107 @@ func Unmarshal(serializedZtoc io.Reader) (*Ztoc, error) {
 		return nil, err
 	}
 
-	return flatbufToZtoc(flatbuf)
+	return UnmarshalWithPrefetch(flatbuf)
+}
+
+// UnmarshalWithPrefetch deserializes ztoc data that may contain embedded prefetch files
+// Expected blob structure: [ztoc] + [prefetch metadata] + [file1 content] + [file2 content] + ...
+func UnmarshalWithPrefetch(data []byte) (*Ztoc, error) {
+	// 首先尝试查找 JSON 元数据的开始位置
+	// JSON 应该以 '{"layer_digest"' 开始
+	jsonStart := bytes.Index(data, []byte(`{"layer_digest"`))
+	if jsonStart == -1 {
+		// 没有找到预取文件元数据，作为普通 ztoc 处理
+		return flatbufToZtoc(data)
+	}
+
+	// 分离 ztoc 数据和预取文件数据
+	ztocData := data[:jsonStart]
+	prefetchData := data[jsonStart:]
+
+	// 解析 ztoc
+	ztoc, err := flatbufToZtoc(ztocData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ztoc: %w", err)
+	}
+
+	// 解析预取文件数据
+	if err := parseAndLoadPrefetchData(ztoc, prefetchData); err != nil {
+		return nil, fmt.Errorf("failed to parse prefetch data: %w", err)
+	}
+
+	return ztoc, nil
+}
+
+// parseAndLoadPrefetchData 解析并加载预取文件数据
+func parseAndLoadPrefetchData(ztoc *Ztoc, data []byte) error {
+	// 查找 JSON 元数据的结束位置
+	// JSON 数据应该以 '}' 结束，我们找到第一个完整的 JSON 对象
+
+	var jsonEnd int = -1
+	braceCount := 0
+	inString := false
+	escaped := false
+
+	for i, b := range data {
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if b == '\\' {
+			escaped = true
+			continue
+		}
+
+		if b == '"' {
+			inString = !inString
+			continue
+		}
+
+		if inString {
+			continue
+		}
+
+		if b == '{' {
+			braceCount++
+		} else if b == '}' {
+			braceCount--
+			if braceCount == 0 {
+				jsonEnd = i + 1
+				break
+			}
+		}
+	}
+
+	if jsonEnd == -1 {
+		return fmt.Errorf("could not find complete JSON metadata")
+	}
+
+	// 解析元数据
+	metadataBytes := data[:jsonEnd]
+	var metadata PrefetchMetadata
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		return fmt.Errorf("failed to unmarshal prefetch metadata: %w", err)
+	}
+
+	// 验证并更新文件内容偏移量
+	fileContentStart := jsonEnd
+	for i := range metadata.PrefetchFiles {
+		// 更新偏移量为在当前 blob 中的位置
+		metadata.PrefetchFiles[i].Offset = int64(fileContentStart)
+
+		if fileContentStart+int(metadata.PrefetchFiles[i].Size) > len(data) {
+			return fmt.Errorf("prefetch file %d extends beyond data boundary", i)
+		}
+
+		fileContentStart += int(metadata.PrefetchFiles[i].Size)
+	}
+
+	// 加载预取文件信息到 ztoc
+	ztoc.PrefetchFiles = metadata.PrefetchFiles
+
+	return nil
 }
 
 func flatbufToZtoc(flatbuffer []byte) (z *Ztoc, err error) {
@@ -216,6 +317,100 @@ func ztocToFlatbuffer(ztoc *Ztoc) (fb []byte, err error) {
 	ztocFlatbuf := ztoc_flatbuffers.ZtocEnd(builder)
 	builder.Finish(ztocFlatbuf)
 	return builder.FinishedBytes(), nil
+}
+
+// MarshalWithPrefetch serializes Ztoc with prefetch files and their content embedded in the same blob
+// Blob structure: [ztoc] + [prefetch metadata] + [file1 content] + [file2 content] + ...
+func MarshalWithPrefetch(ztoc *Ztoc, layerDigest string) (io.Reader, ocispec.Descriptor, error) {
+	// 1. 正常序列化 ztoc
+	ztocReader, ztocDesc, err := Marshal(ztoc)
+	if err != nil {
+		return nil, ocispec.Descriptor{}, err
+	}
+
+	// 2. 如果没有预取文件，直接返回原始数据
+	if len(ztoc.PrefetchFiles) == 0 {
+		return ztocReader, ztocDesc, nil
+	}
+
+	// 3. 读取 ztoc 数据
+	ztocData, err := io.ReadAll(ztocReader)
+	if err != nil {
+		return nil, ocispec.Descriptor{}, err
+	}
+
+	// 4. 计算预取文件内容的偏移量
+	// 结构: [ztoc] + [metadata] + [file1] + [file2] + ...
+	currentOffset := int64(len(ztocData))
+
+	// 先计算元数据的大小（临时创建以获取大小）
+	tempMetadata := PrefetchMetadata{
+		LayerDigest:   layerDigest,
+		PrefetchFiles: ztoc.PrefetchFiles, // 使用原始偏移量先计算
+		CreatedAt:     time.Now(),
+		Version:       "1.0",
+	}
+	tempMetadataBytes, err := json.Marshal(tempMetadata)
+	if err != nil {
+		return nil, ocispec.Descriptor{}, err
+	}
+
+	// 元数据之后就是文件内容的开始位置
+	currentOffset += int64(len(tempMetadataBytes))
+
+	// 更新预取文件的偏移量为在索引 blob 中的位置
+	updatedPrefetchFiles := make([]PrefetchFileInfo, len(ztoc.PrefetchFiles))
+	for i, file := range ztoc.PrefetchFiles {
+		updatedPrefetchFiles[i] = PrefetchFileInfo{
+			Path:   file.Path,
+			Size:   file.Size,
+			Offset: currentOffset, // 在索引 blob 中的偏移量
+		}
+		// 移动到下一个文件的位置
+		if i < len(ztoc.PrefetchFileContents) {
+			currentOffset += int64(len(ztoc.PrefetchFileContents[i]))
+		}
+	}
+
+	// 创建最终的元数据（包含更新后的偏移量）
+	finalMetadata := PrefetchMetadata{
+		LayerDigest:   layerDigest,
+		PrefetchFiles: updatedPrefetchFiles,
+		CreatedAt:     time.Now(),
+		Version:       "1.0",
+	}
+
+	prefetchMetadata, err := json.Marshal(finalMetadata)
+	if err != nil {
+		return nil, ocispec.Descriptor{}, err
+	}
+
+	// 5. 构建最终的 blob: ztoc + metadata + file contents
+	totalSize := len(ztocData) + len(prefetchMetadata)
+	for _, content := range ztoc.PrefetchFileContents {
+		totalSize += len(content)
+	}
+
+	combinedData := make([]byte, 0, totalSize)
+
+	// 添加 ztoc 数据
+	combinedData = append(combinedData, ztocData...)
+
+	// 添加预取文件元数据
+	combinedData = append(combinedData, prefetchMetadata...)
+
+	// 添加预取文件的实际内容
+	for _, content := range ztoc.PrefetchFileContents {
+		combinedData = append(combinedData, content...)
+	}
+
+	// 6. 创建新的 descriptor
+	newDesc := ocispec.Descriptor{
+		Digest: digest.FromBytes(combinedData),
+		Size:   int64(len(combinedData)),
+	}
+
+	return bytes.NewReader(combinedData), newDesc, nil
 }
 
 func tocToFlatbuffer(toc *TOC, builder *flatbuffers.Builder) flatbuffers.UOffsetT {

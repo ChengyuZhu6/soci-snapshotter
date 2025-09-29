@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/awslabs/soci-snapshotter/cmd/soci/commands/internal"
 	"github.com/awslabs/soci-snapshotter/soci"
@@ -90,7 +91,14 @@ var infoCommand = &cli.Command{
 			return err
 		}
 		defer reader.Close()
-		ztoc, err := ztoc.Unmarshal(reader)
+
+		// 读取所有数据以支持预取文件解析
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+
+		ztoc, err := ztoc.UnmarshalWithPrefetch(data)
 		if err != nil {
 			return err
 		}

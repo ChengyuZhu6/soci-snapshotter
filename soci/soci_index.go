@@ -533,10 +533,12 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 				continue
 			}
 
+			fmt.Printf("DEBUG: Scanning layer %s (size: %d bytes, media type: %s)\n", layer.Digest, layer.Size, layer.MediaType)
 			var layerPrefetchFiles []ztoc.PrefetchFileInfo
 			for _, prefetchPath := range b.config.prefetchPaths {
 				// if the file is already found in the upper layer, skip
 				if foundPrefetchFiles[prefetchPath] {
+					fmt.Printf("DEBUG: Skipping %s (already found in upper layer)\n", prefetchPath)
 					continue
 				}
 
@@ -548,12 +550,15 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 						Offset: offset,
 					})
 					foundPrefetchFiles[prefetchPath] = true
-					fmt.Printf("Found prefetch file %s (size: %d bytes, offset: %d) in layer %s\n", prefetchPath, size, offset, layer.Digest)
+					fmt.Printf("✓ Found prefetch file %s (size: %d bytes, offset: %d) in layer %s\n", prefetchPath, size, offset, layer.Digest)
+				} else {
+					fmt.Printf("✗ File %s not found in layer %s\n", prefetchPath, layer.Digest)
 				}
 			}
 
 			if len(layerPrefetchFiles) > 0 {
 				layerPrefetchMap[layer.Digest.String()] = layerPrefetchFiles
+				fmt.Printf("DEBUG: Added %d prefetch files to layer %s\n", len(layerPrefetchFiles), layer.Digest)
 			}
 		}
 	}
@@ -639,6 +644,7 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 func (b *IndexBuilder) checkFileExistsInLayer(ctx context.Context, desc ocispec.Descriptor, filePath string) (bool, int64, int64) {
 	ra, err := b.contentStore.ReaderAt(ctx, desc)
 	if err != nil {
+		fmt.Printf("DEBUG: Failed to get reader for layer %s: %v\n", desc.Digest, err)
 		return false, 0, 0
 	}
 	defer ra.Close()
@@ -684,6 +690,9 @@ func (b *IndexBuilder) checkFileExistsInLayer(ctx context.Context, desc ocispec.
 	tarReader := tar.NewReader(reader)
 	targetPath := strings.TrimPrefix(filePath, "./")
 	var currentOffset int64 = 0
+	var fileCount int = 0
+
+	fmt.Printf("DEBUG: Looking for file '%s' in layer %s\n", targetPath, desc.Digest)
 
 	for {
 		header, err := tarReader.Next()
@@ -694,8 +703,11 @@ func (b *IndexBuilder) checkFileExistsInLayer(ctx context.Context, desc ocispec.
 			return false, 0, 0
 		}
 
+		fileCount++
 		headerPath := strings.TrimPrefix(header.Name, "./")
+
 		if headerPath == targetPath && header.Typeflag == tar.TypeReg {
+			fmt.Printf("DEBUG: ✓ Found exact match: %s\n", headerPath)
 			// return the file exists, size, and current offset
 			return true, header.Size, currentOffset
 		}
@@ -768,7 +780,7 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, err
 	}
 
-	ztocReader, ztocDesc, err := ztoc.Marshal(toc)
+	ztocReader, ztocDesc, err := ztoc.MarshalWithPrefetch(toc, desc.Digest.String())
 	if err != nil {
 		return nil, err
 	}
@@ -776,6 +788,11 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 	err = b.blobStore.Push(ctx, ztocDesc, ztocReader)
 	if err != nil && !store.IsErrAlreadyExists(err) {
 		return nil, fmt.Errorf("cannot push ztoc to local store: %w", err)
+	}
+
+	// 如果有预取文件，记录日志
+	if len(toc.PrefetchFiles) > 0 {
+		fmt.Printf("Embedded %d prefetch files in ztoc blob for layer %s\n", len(toc.PrefetchFiles), desc.Digest)
 	}
 
 	// write the artifact entry for soci layer
@@ -859,13 +876,17 @@ func (b *IndexBuilder) buildSociLayerWithPrefetch(ctx context.Context, desc ocis
 		return nil, err
 	}
 
-	// 添加预取文件信息
+	// 提取预取文件的实际内容并更新偏移量
 	if len(prefetchFiles) > 0 {
-		toc.PrefetchFiles = prefetchFiles
-		fmt.Printf("Added %d prefetch files to layer %s\n", len(prefetchFiles), desc.Digest)
+		updatedPrefetchFiles, err := b.extractPrefetchFileContents(tmpFile.Name(), prefetchFiles, toc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract prefetch file contents: %w", err)
+		}
+		toc.PrefetchFiles = updatedPrefetchFiles
+		fmt.Printf("Added %d prefetch files to layer %s\n", len(updatedPrefetchFiles), desc.Digest)
 	}
 
-	ztocReader, ztocDesc, err := ztoc.Marshal(toc)
+	ztocReader, ztocDesc, err := ztoc.MarshalWithPrefetch(toc, desc.Digest.String())
 	if err != nil {
 		return nil, err
 	}
@@ -873,6 +894,11 @@ func (b *IndexBuilder) buildSociLayerWithPrefetch(ctx context.Context, desc ocis
 	err = b.blobStore.Push(ctx, ztocDesc, ztocReader)
 	if err != nil && !store.IsErrAlreadyExists(err) {
 		return nil, fmt.Errorf("cannot push ztoc to local store: %w", err)
+	}
+
+	// 如果有预取文件，记录日志
+	if len(toc.PrefetchFiles) > 0 {
+		fmt.Printf("Embedded %d prefetch files in ztoc blob for layer %s\n", len(toc.PrefetchFiles), desc.Digest)
 	}
 
 	// write the artifact entry for soci layer
@@ -899,6 +925,61 @@ func (b *IndexBuilder) buildSociLayerWithPrefetch(ctx context.Context, desc ocis
 	}
 	b.maybeAddDisableXattrAnnotation(&ztocDesc, toc)
 	return &ztocDesc, err
+}
+
+// extractPrefetchFileContents extracts the actual content of prefetch files and updates their offsets
+func (b *IndexBuilder) extractPrefetchFileContents(layerPath string, prefetchFiles []ztoc.PrefetchFileInfo, toc *ztoc.Ztoc) ([]ztoc.PrefetchFileInfo, error) {
+	if len(prefetchFiles) == 0 {
+		return nil, nil
+	}
+
+	// 打开层文件
+	file, err := os.Open(layerPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// 创建 section reader
+	// 获取文件大小
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	sr := io.NewSectionReader(file, 0, fileInfo.Size())
+
+	var updatedFiles []ztoc.PrefetchFileInfo
+	var fileContents [][]byte
+
+	// 提取每个预取文件的内容
+	for _, prefetchFile := range prefetchFiles {
+		fmt.Printf("Extracting prefetch file: %s (size: %d, offset: %d)\n",
+			prefetchFile.Path, prefetchFile.Size, prefetchFile.Offset)
+
+		// 使用 ztoc 的 ExtractFile 方法提取文件内容
+		content, err := toc.ExtractFile(sr, prefetchFile.Path)
+		if err != nil {
+			fmt.Printf("Warning: failed to extract prefetch file %s: %v\n", prefetchFile.Path, err)
+			continue
+		}
+
+		if int64(len(content)) != prefetchFile.Size {
+			fmt.Printf("Warning: size mismatch for file %s: expected %d, got %d\n",
+				prefetchFile.Path, prefetchFile.Size, len(content))
+		}
+
+		fileContents = append(fileContents, content)
+		updatedFiles = append(updatedFiles, ztoc.PrefetchFileInfo{
+			Path:   prefetchFile.Path,
+			Size:   int64(len(content)),
+			Offset: 0, // 将在序列化时更新
+		})
+	}
+
+	// 将文件内容存储到 toc 中，以便序列化时使用
+	toc.PrefetchFileContents = fileContents
+
+	return updatedFiles, nil
 }
 
 // NewIndex returns a new index.
