@@ -52,6 +52,14 @@ type Ztoc struct {
 	BuildToolIdentifier     string
 	CompressedArchiveSize   compression.Offset
 	UncompressedArchiveSize compression.Offset
+
+	PrefetchFiles []PrefetchFileInfo `json:"prefetchFiles,omitempty"`
+}
+
+type PrefetchFileInfo struct {
+	Path   string `json:"path"`   // file path
+	Offset int64  `json:"offset"` // offset in the index image
+	Size   int64  `json:"size"`   // file size
 }
 
 // CompressionInfo is the "zinfo" part of ztoc including the `Checkpoints` data
@@ -257,4 +265,17 @@ func (zt Ztoc) ExtractFromTarGz(gz string, filename string) (string, error) {
 // algorithm in the ztoc.
 func (zt Ztoc) Zinfo() (compression.Zinfo, error) {
 	return compression.NewZinfo(zt.CompressionAlgorithm, zt.Checkpoints)
+}
+
+func (zt Ztoc) HasPrefetchFiles() bool {
+	return len(zt.PrefetchFiles) > 0
+}
+
+func (zt Ztoc) GetPrefetchFile(path string) (*PrefetchFileInfo, bool) {
+	for i := range zt.PrefetchFiles {
+		if zt.PrefetchFiles[i].Path == path {
+			return &zt.PrefetchFiles[i], true
+		}
+	}
+	return nil, false
 }
