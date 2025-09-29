@@ -17,11 +17,15 @@
 package ztoc
 
 import (
+	"archive/tar"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -63,20 +67,56 @@ func Unmarshal(serializedZtoc io.Reader) (*Ztoc, error) {
 	return UnmarshalWithPrefetch(flatbuf)
 }
 
-// UnmarshalWithPrefetch deserializes ztoc data that may contain embedded prefetch files
-// Expected blob structure: [ztoc] + [prefetch metadata] + [file1 content] + [file2 content] + ...
+// UnmarshalWithPrefetch deserializes ztoc data that may be in tar format containing ztoc.info + prefetch files
 func UnmarshalWithPrefetch(data []byte) (*Ztoc, error) {
-	// 首先尝试查找 JSON 元数据的开始位置
-	// JSON 应该以 '{"layer_digest"' 开始
-	jsonStart := bytes.Index(data, []byte(`{"layer_digest"`))
-	if jsonStart == -1 {
-		// 没有找到预取文件元数据，作为普通 ztoc 处理
-		return flatbufToZtoc(data)
+	// 尝试解析为 tar 格式
+	tarReader := tar.NewReader(bytes.NewReader(data))
+
+	var ztocData []byte
+	var prefetchMetadata PrefetchMetadata
+	prefetchFiles := make(map[string][]byte)
+
+	// 遍历 tar 文件中的所有条目
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// 如果不是 tar 格式，尝试作为原始 ztoc 数据处理
+			return flatbufToZtoc(data)
+		}
+
+		switch header.Name {
+		case "ztoc.info":
+			// 读取 ztoc 数据
+			ztocData, err = io.ReadAll(tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read ztoc.info: %w", err)
+			}
+		case "prefetch.json":
+			// 读取预取文件元数据
+			metadataBytes, err := io.ReadAll(tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read prefetch.json: %w", err)
+			}
+			if err := json.Unmarshal(metadataBytes, &prefetchMetadata); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal prefetch metadata: %w", err)
+			}
+		default:
+			// 读取预取文件内容
+			fileContent, err := io.ReadAll(tarReader)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read prefetch file %s: %w", header.Name, err)
+			}
+			prefetchFiles[header.Name] = fileContent
+		}
 	}
 
-	// 分离 ztoc 数据和预取文件数据
-	ztocData := data[:jsonStart]
-	prefetchData := data[jsonStart:]
+	// 如果没有找到 ztoc.info，尝试作为原始数据处理
+	if len(ztocData) == 0 {
+		return flatbufToZtoc(data)
+	}
 
 	// 解析 ztoc
 	ztoc, err := flatbufToZtoc(ztocData)
@@ -84,9 +124,16 @@ func UnmarshalWithPrefetch(data []byte) (*Ztoc, error) {
 		return nil, fmt.Errorf("failed to unmarshal ztoc: %w", err)
 	}
 
-	// 解析预取文件数据
-	if err := parseAndLoadPrefetchData(ztoc, prefetchData); err != nil {
-		return nil, fmt.Errorf("failed to parse prefetch data: %w", err)
+	// 如果有预取文件元数据，设置预取文件信息
+	if len(prefetchMetadata.PrefetchFiles) > 0 {
+		ztoc.PrefetchFiles = prefetchMetadata.PrefetchFiles
+
+		// 验证预取文件内容是否存在
+		for _, fileInfo := range ztoc.PrefetchFiles {
+			if _, exists := prefetchFiles[fileInfo.Path]; !exists {
+				fmt.Printf("Warning: prefetch file %s not found in tar archive\n", fileInfo.Path)
+			}
+		}
 	}
 
 	return ztoc, nil
@@ -319,98 +366,182 @@ func ztocToFlatbuffer(ztoc *Ztoc) (fb []byte, err error) {
 	return builder.FinishedBytes(), nil
 }
 
-// MarshalWithPrefetch serializes Ztoc with prefetch files and their content embedded in the same blob
-// Blob structure: [ztoc] + [prefetch metadata] + [file1 content] + [file2 content] + ...
+// MarshalWithPrefetch creates a tar archive containing ztoc.info + prefetch.json + prefetch files
 func MarshalWithPrefetch(ztoc *Ztoc, layerDigest string) (io.Reader, ocispec.Descriptor, error) {
-	// 1. 正常序列化 ztoc
-	ztocReader, ztocDesc, err := Marshal(ztoc)
+
+	// 创建 tar 缓冲区
+	var tarBuf bytes.Buffer
+	tarWriter := tar.NewWriter(&tarBuf)
+	defer tarWriter.Close()
+
+	// 1. 添加 ztoc.info 文件
+	ztocReader, _, err := Marshal(ztoc)
 	if err != nil {
-		return nil, ocispec.Descriptor{}, err
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to marshal ztoc: %w", err)
 	}
 
-	// 2. 如果没有预取文件，直接返回原始数据
-	if len(ztoc.PrefetchFiles) == 0 {
-		return ztocReader, ztocDesc, nil
-	}
-
-	// 3. 读取 ztoc 数据
 	ztocData, err := io.ReadAll(ztocReader)
 	if err != nil {
-		return nil, ocispec.Descriptor{}, err
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to read ztoc data: %w", err)
 	}
 
-	// 4. 计算预取文件内容的偏移量
-	// 结构: [ztoc] + [metadata] + [file1] + [file2] + ...
-	currentOffset := int64(len(ztocData))
+	ztocHeader := &tar.Header{
+		Name:    "ztoc.info",
+		Mode:    0644,
+		Size:    int64(len(ztocData)),
+		ModTime: time.Now(),
+	}
+	if err := tarWriter.WriteHeader(ztocHeader); err != nil {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write ztoc header: %w", err)
+	}
+	if _, err := tarWriter.Write(ztocData); err != nil {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write ztoc data: %w", err)
+	}
 
-	// 先计算元数据的大小（临时创建以获取大小）
-	tempMetadata := PrefetchMetadata{
+	// 2. 添加 prefetch.json 文件
+	metadata := PrefetchMetadata{
 		LayerDigest:   layerDigest,
-		PrefetchFiles: ztoc.PrefetchFiles, // 使用原始偏移量先计算
-		CreatedAt:     time.Now(),
-		Version:       "1.0",
-	}
-	tempMetadataBytes, err := json.Marshal(tempMetadata)
-	if err != nil {
-		return nil, ocispec.Descriptor{}, err
-	}
-
-	// 元数据之后就是文件内容的开始位置
-	currentOffset += int64(len(tempMetadataBytes))
-
-	// 更新预取文件的偏移量为在索引 blob 中的位置
-	updatedPrefetchFiles := make([]PrefetchFileInfo, len(ztoc.PrefetchFiles))
-	for i, file := range ztoc.PrefetchFiles {
-		updatedPrefetchFiles[i] = PrefetchFileInfo{
-			Path:   file.Path,
-			Size:   file.Size,
-			Offset: currentOffset, // 在索引 blob 中的偏移量
-		}
-		// 移动到下一个文件的位置
-		if i < len(ztoc.PrefetchFileContents) {
-			currentOffset += int64(len(ztoc.PrefetchFileContents[i]))
-		}
-	}
-
-	// 创建最终的元数据（包含更新后的偏移量）
-	finalMetadata := PrefetchMetadata{
-		LayerDigest:   layerDigest,
-		PrefetchFiles: updatedPrefetchFiles,
+		PrefetchFiles: ztoc.PrefetchFiles,
 		CreatedAt:     time.Now(),
 		Version:       "1.0",
 	}
 
-	prefetchMetadata, err := json.Marshal(finalMetadata)
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
-		return nil, ocispec.Descriptor{}, err
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to marshal prefetch metadata: %w", err)
 	}
 
-	// 5. 构建最终的 blob: ztoc + metadata + file contents
-	totalSize := len(ztocData) + len(prefetchMetadata)
-	for _, content := range ztoc.PrefetchFileContents {
-		totalSize += len(content)
+	metadataHeader := &tar.Header{
+		Name:    "prefetch.json",
+		Mode:    0644,
+		Size:    int64(len(metadataBytes)),
+		ModTime: time.Now(),
+	}
+	if err := tarWriter.WriteHeader(metadataHeader); err != nil {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch metadata header: %w", err)
+	}
+	if _, err := tarWriter.Write(metadataBytes); err != nil {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch metadata: %w", err)
 	}
 
-	combinedData := make([]byte, 0, totalSize)
+	// 3. 添加实际的预取文件内容（保持原始路径）
+	for i, fileInfo := range ztoc.PrefetchFiles {
+		if i >= len(ztoc.PrefetchFileContents) {
+			return nil, ocispec.Descriptor{}, fmt.Errorf("missing content for prefetch file %d", i)
+		}
 
-	// 添加 ztoc 数据
-	combinedData = append(combinedData, ztocData...)
-
-	// 添加预取文件元数据
-	combinedData = append(combinedData, prefetchMetadata...)
-
-	// 添加预取文件的实际内容
-	for _, content := range ztoc.PrefetchFileContents {
-		combinedData = append(combinedData, content...)
+		fileContent := ztoc.PrefetchFileContents[i]
+		fileHeader := &tar.Header{
+			Name:    fileInfo.Path, // 使用原始文件路径
+			Mode:    0644,
+			Size:    int64(len(fileContent)),
+			ModTime: time.Now(),
+		}
+		if err := tarWriter.WriteHeader(fileHeader); err != nil {
+			return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch file header for %s: %w", fileInfo.Path, err)
+		}
+		if _, err := tarWriter.Write(fileContent); err != nil {
+			return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch file content for %s: %w", fileInfo.Path, err)
+		}
 	}
 
-	// 6. 创建新的 descriptor
-	newDesc := ocispec.Descriptor{
-		Digest: digest.FromBytes(combinedData),
-		Size:   int64(len(combinedData)),
+	// 关闭 tar writer
+	if err := tarWriter.Close(); err != nil {
+		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to close tar writer: %w", err)
 	}
 
-	return bytes.NewReader(combinedData), newDesc, nil
+	// 创建描述符
+	tarData := tarBuf.Bytes()
+	desc := ocispec.Descriptor{
+		Digest: digest.FromBytes(tarData),
+		Size:   int64(len(tarData)),
+	}
+
+	fmt.Printf("Created tar archive with ztoc.info + prefetch.json + %d prefetch files for layer %s\n",
+		len(ztoc.PrefetchFiles), layerDigest)
+
+	return bytes.NewReader(tarData), desc, nil
+}
+
+// SavePrefetchFiles saves prefetch files as separate files
+func SavePrefetchFiles(ztoc *Ztoc, layerDigest string, baseDir string) error {
+	if len(ztoc.PrefetchFiles) == 0 {
+		return nil
+	}
+
+	// 创建预取文件目录
+	prefetchDir := filepath.Join(baseDir, "prefetch", layerDigest)
+	if err := os.MkdirAll(prefetchDir, 0755); err != nil {
+		return fmt.Errorf("failed to create prefetch directory: %w", err)
+	}
+
+	// 保存预取文件元数据
+	metadata := PrefetchMetadata{
+		LayerDigest:   layerDigest,
+		PrefetchFiles: ztoc.PrefetchFiles,
+		CreatedAt:     time.Now(),
+		Version:       "1.0",
+	}
+
+	metadataPath := filepath.Join(baseDir, "prefetch.json")
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal prefetch metadata: %w", err)
+	}
+
+	if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
+		return fmt.Errorf("failed to write prefetch metadata: %w", err)
+	}
+
+	// 保存每个预取文件的内容
+	for i, fileInfo := range ztoc.PrefetchFiles {
+		if i >= len(ztoc.PrefetchFileContents) {
+			return fmt.Errorf("missing content for prefetch file %d", i)
+		}
+
+		// 使用文件路径的哈希作为文件名，避免路径冲突
+		hasher := sha256.New()
+		hasher.Write([]byte(fileInfo.Path))
+		fileName := fmt.Sprintf("%x", hasher.Sum(nil))
+
+		filePath := filepath.Join(prefetchDir, fileName)
+		if err := os.WriteFile(filePath, ztoc.PrefetchFileContents[i], 0644); err != nil {
+			return fmt.Errorf("failed to write prefetch file %s: %w", fileInfo.Path, err)
+		}
+
+		fmt.Printf("Saved prefetch file %s to %s\n", fileInfo.Path, filePath)
+	}
+
+	fmt.Printf("Saved %d prefetch files for layer %s\n", len(ztoc.PrefetchFiles), layerDigest)
+	return nil
+}
+
+// LoadPrefetchFiles loads prefetch files from separate files
+func LoadPrefetchFiles(layerDigest string, baseDir string) ([]PrefetchFileInfo, error) {
+	metadataPath := filepath.Join(baseDir, "prefetch.json")
+
+	// 检查元数据文件是否存在
+	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+		return nil, nil // 没有预取文件
+	}
+
+	// 读取元数据
+	metadataBytes, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read prefetch metadata: %w", err)
+	}
+
+	var metadata PrefetchMetadata
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal prefetch metadata: %w", err)
+	}
+
+	// 只返回匹配的层的预取文件
+	if metadata.LayerDigest != layerDigest {
+		return nil, nil
+	}
+
+	return metadata.PrefetchFiles, nil
 }
 
 func tocToFlatbuffer(toc *TOC, builder *flatbuffers.Builder) flatbuffers.UOffsetT {

@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 
 	"github.com/awslabs/soci-snapshotter/cmd/soci/commands/internal"
 	"github.com/awslabs/soci-snapshotter/soci"
@@ -92,16 +91,19 @@ var infoCommand = &cli.Command{
 		}
 		defer reader.Close()
 
-		// 读取所有数据以支持预取文件解析
-		data, err := io.ReadAll(reader)
+		// 使用标准的 Unmarshal，然后从分离的文件中加载预取文件信息
+		ztoc, err := ztoc.Unmarshal(reader)
 		if err != nil {
 			return err
 		}
 
-		ztoc, err := ztoc.UnmarshalWithPrefetch(data)
-		if err != nil {
-			return err
-		}
+		// TODO: 实现从分离文件中加载预取文件信息
+		// 暂时使用空的预取文件列表
+		// baseDir := "/tmp/soci-prefetch"
+		// prefetchFiles, loadErr := ztoc.LoadPrefetchFiles(digest.String(), baseDir)
+		// if loadErr == nil && prefetchFiles != nil {
+		//     ztoc.PrefetchFiles = prefetchFiles
+		// }
 		gzInfo, err := ztoc.Zinfo()
 		if err != nil {
 			return err

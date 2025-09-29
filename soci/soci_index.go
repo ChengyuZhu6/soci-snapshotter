@@ -790,9 +790,12 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 		return nil, fmt.Errorf("cannot push ztoc to local store: %w", err)
 	}
 
-	// 如果有预取文件，记录日志
 	if len(toc.PrefetchFiles) > 0 {
-		fmt.Printf("Embedded %d prefetch files in ztoc blob for layer %s\n", len(toc.PrefetchFiles), desc.Digest)
+		baseDir := "/tmp/soci-prefetch"
+		if err := ztoc.SavePrefetchFiles(toc, desc.Digest.String(), baseDir); err != nil {
+			return nil, fmt.Errorf("failed to save prefetch files: %w", err)
+		}
+		fmt.Printf("Saved %d prefetch files for layer %s\n", len(toc.PrefetchFiles), desc.Digest)
 	}
 
 	// write the artifact entry for soci layer
@@ -933,30 +936,25 @@ func (b *IndexBuilder) extractPrefetchFileContents(layerPath string, prefetchFil
 		return nil, nil
 	}
 
-	// 打开层文件
 	file, err := os.Open(layerPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open layer file: %w", err)
 	}
 	defer file.Close()
 
-	// 创建 section reader
-	// 获取文件大小
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get file info: %w", err)
 	}
 	sr := io.NewSectionReader(file, 0, fileInfo.Size())
 
 	var updatedFiles []ztoc.PrefetchFileInfo
 	var fileContents [][]byte
 
-	// 提取每个预取文件的内容
 	for _, prefetchFile := range prefetchFiles {
 		fmt.Printf("Extracting prefetch file: %s (size: %d, offset: %d)\n",
 			prefetchFile.Path, prefetchFile.Size, prefetchFile.Offset)
 
-		// 使用 ztoc 的 ExtractFile 方法提取文件内容
 		content, err := toc.ExtractFile(sr, prefetchFile.Path)
 		if err != nil {
 			fmt.Printf("Warning: failed to extract prefetch file %s: %v\n", prefetchFile.Path, err)
@@ -972,13 +970,16 @@ func (b *IndexBuilder) extractPrefetchFileContents(layerPath string, prefetchFil
 		updatedFiles = append(updatedFiles, ztoc.PrefetchFileInfo{
 			Path:   prefetchFile.Path,
 			Size:   int64(len(content)),
-			Offset: 0, // 将在序列化时更新
+			Offset: prefetchFile.Offset,
 		})
+
+		fmt.Printf("✓ Successfully extracted prefetch file %s: %d bytes\n",
+			prefetchFile.Path, len(content))
 	}
 
-	// 将文件内容存储到 toc 中，以便序列化时使用
 	toc.PrefetchFileContents = fileContents
 
+	fmt.Printf("Successfully extracted %d prefetch files with total content\n", len(updatedFiles))
 	return updatedFiles, nil
 }
 
