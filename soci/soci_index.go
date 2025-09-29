@@ -17,7 +17,9 @@
 package soci
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,11 +36,11 @@ import (
 	"github.com/awslabs/soci-snapshotter/ztoc"
 	"github.com/awslabs/soci-snapshotter/ztoc/compression"
 	"github.com/containerd/containerd/content"
-	"github.com/containerd/errdefs"
-
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -290,6 +292,7 @@ type builderConfig struct {
 	buildToolIdentifier string
 	artifactsDb         *ArtifactsDb
 	optimizations       []Optimization
+	prefetchPaths       []string
 }
 
 func (b *builderConfig) hasOptimization(o Optimization) bool {
@@ -370,6 +373,13 @@ func WithBuildToolIdentifier(tool string) BuilderOption {
 func WithArtifactsDb(db *ArtifactsDb) BuilderOption {
 	return func(c *builderConfig) error {
 		c.artifactsDb = db
+		return nil
+	}
+}
+
+func WithPrefetchPaths(paths []string) BuilderOption {
+	return func(c *builderConfig) error {
+		c.prefetchPaths = paths
 		return nil
 	}
 }
@@ -512,6 +522,42 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 		return nil, err
 	}
 
+	// scan prefetch files (from top to bottom, handle file overrides)
+	layerPrefetchMap := make(map[string][]ztoc.PrefetchFileInfo)
+	if len(b.config.prefetchPaths) > 0 {
+		foundPrefetchFiles := make(map[string]bool)
+		// scan from the top layer (in reverse order)
+		for i := len(manifest.Layers) - 1; i >= 0; i-- {
+			layer := manifest.Layers[i]
+			if !images.IsLayerType(layer.MediaType) {
+				continue
+			}
+
+			var layerPrefetchFiles []ztoc.PrefetchFileInfo
+			for _, prefetchPath := range b.config.prefetchPaths {
+				// if the file is already found in the upper layer, skip
+				if foundPrefetchFiles[prefetchPath] {
+					continue
+				}
+
+				// check if the current layer contains this prefetch file
+				if exists, size, offset := b.checkFileExistsInLayer(ctx, layer, prefetchPath); exists {
+					layerPrefetchFiles = append(layerPrefetchFiles, ztoc.PrefetchFileInfo{
+						Path:   prefetchPath,
+						Size:   size,
+						Offset: offset,
+					})
+					foundPrefetchFiles[prefetchPath] = true
+					fmt.Printf("Found prefetch file %s (size: %d bytes, offset: %d) in layer %s\n", prefetchPath, size, offset, layer.Digest)
+				}
+			}
+
+			if len(layerPrefetchFiles) > 0 {
+				layerPrefetchMap[layer.Digest.String()] = layerPrefetchFiles
+			}
+		}
+	}
+
 	// attempt to build a ztoc for each layer
 	sociLayersDesc := make([]*ocispec.Descriptor, len(manifest.Layers))
 	errChan := make(chan error)
@@ -521,7 +567,9 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 			wg.Add(1)
 			go func(i int, l ocispec.Descriptor) {
 				defer wg.Done()
-				desc, err := b.buildSociLayer(ctx, l)
+				// get the prefetch file information for the layer
+				prefetchFiles := layerPrefetchMap[l.Digest.String()]
+				desc, err := b.buildSociLayerWithPrefetch(ctx, l, prefetchFiles)
 				if err != nil {
 					if err != errUnsupportedLayerFormat {
 						errChan <- err
@@ -578,7 +626,6 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 	}
 
 	index := NewIndex(buildCfg.indexVersion, ztocsDesc, refers, annotations)
-
 	return &IndexWithMetadata{
 		Index:        index,
 		Platform:     &buildCfg.platform,
@@ -586,6 +633,82 @@ func (b *IndexBuilder) build(ctx context.Context, img images.Image, buildCfg bui
 		ManifestDesc: *imgManifestDesc,
 		CreatedAt:    time.Now(),
 	}, nil
+}
+
+// checkFileExistsInLayer checks if a file exists in a specified layer and returns whether it exists, file size, and offset
+func (b *IndexBuilder) checkFileExistsInLayer(ctx context.Context, desc ocispec.Descriptor, filePath string) (bool, int64, int64) {
+	ra, err := b.contentStore.ReaderAt(ctx, desc)
+	if err != nil {
+		return false, 0, 0
+	}
+	defer ra.Close()
+
+	sr := io.NewSectionReader(ra, 0, desc.Size)
+
+	// decompress the layer based on the compression format
+	compressionAlgo, err := images.DiffCompression(ctx, desc.MediaType)
+	if err != nil {
+		return false, 0, 0
+	}
+
+	if compressionAlgo == "" {
+		switch desc.MediaType {
+		case ocispec.MediaTypeImageLayer:
+			compressionAlgo = compression.Uncompressed
+		}
+	}
+
+	var reader io.Reader = sr
+	switch compressionAlgo {
+	case compression.Gzip:
+		gzReader, err := gzip.NewReader(sr)
+		if err != nil {
+			return false, 0, 0
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	case compression.Zstd:
+		zstdReader, err := zstd.NewReader(sr)
+		if err != nil {
+			return false, 0, 0
+		}
+		defer zstdReader.Close()
+		reader = zstdReader
+	case compression.Uncompressed, "":
+		reader = sr
+	default:
+		return false, 0, 0
+	}
+
+	// parse tar format, check if the file exists and get the size and offset
+	tarReader := tar.NewReader(reader)
+	targetPath := strings.TrimPrefix(filePath, "./")
+	var currentOffset int64 = 0
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return false, 0, 0
+		}
+
+		headerPath := strings.TrimPrefix(header.Name, "./")
+		if headerPath == targetPath && header.Typeflag == tar.TypeReg {
+			// return the file exists, size, and current offset
+			return true, header.Size, currentOffset
+		}
+
+		// update the offset: skip the content of the current file
+		if header.Typeflag == tar.TypeReg {
+			// calculate the aligned size of the file content (tar format is aligned to 512 bytes)
+			alignedSize := (header.Size + 511) &^ 511
+			currentOffset += alignedSize
+		}
+	}
+
+	return false, 0, 0
 }
 
 // buildSociLayer builds a ztoc for an image layer (`desc`) and returns ztoc descriptor.
@@ -657,6 +780,102 @@ func (b *IndexBuilder) buildSociLayer(ctx context.Context, desc ocispec.Descript
 
 	// write the artifact entry for soci layer
 	// this part is needed for local store only
+	entry := &ArtifactEntry{
+		Size:           ztocDesc.Size,
+		Digest:         ztocDesc.Digest.String(),
+		OriginalDigest: desc.Digest.String(),
+		Type:           ArtifactEntryTypeLayer,
+		Location:       desc.Digest.String(),
+		MediaType:      SociLayerMediaType,
+		CreatedAt:      time.Now(),
+	}
+	err = b.config.artifactsDb.WriteArtifactEntry(entry)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("layer %s -> ztoc %s\n", desc.Digest, ztocDesc.Digest)
+
+	ztocDesc.MediaType = SociLayerMediaType
+	ztocDesc.Annotations = map[string]string{
+		IndexAnnotationImageLayerMediaType: desc.MediaType,
+		IndexAnnotationImageLayerDigest:    desc.Digest.String(),
+	}
+	b.maybeAddDisableXattrAnnotation(&ztocDesc, toc)
+	return &ztocDesc, err
+}
+
+// buildSociLayerWithPrefetch builds a ztoc for an image layer with prefetch files
+func (b *IndexBuilder) buildSociLayerWithPrefetch(ctx context.Context, desc ocispec.Descriptor, prefetchFiles []ztoc.PrefetchFileInfo) (*ocispec.Descriptor, error) {
+	if !images.IsLayerType(desc.MediaType) {
+		return nil, errNotLayerType
+	}
+	// check if we need to skip building the zTOC
+	if skip, reason := skipBuildingZtoc(desc, b.config); skip {
+		fmt.Printf("ztoc skipped - layer %s (%s) %s\n", desc.Digest, desc.MediaType, reason)
+		return nil, nil
+	}
+
+	compressionAlgo, err := images.DiffCompression(ctx, desc.MediaType)
+	if err != nil {
+		return nil, fmt.Errorf("could not determine layer compression: %w", err)
+	}
+
+	if compressionAlgo == "" {
+		switch desc.MediaType {
+		case ocispec.MediaTypeImageLayer:
+			compressionAlgo = compression.Uncompressed
+		}
+	}
+
+	if !b.ztocBuilder.CheckCompressionAlgorithm(compressionAlgo) {
+		fmt.Printf("ztoc skipped - layer %s (%s) is compressed in an unsupported format. expect: [tar, gzip, unknown] but got %q\n",
+			desc.Digest, desc.MediaType, compressionAlgo)
+		return nil, errUnsupportedLayerFormat
+	}
+
+	ra, err := b.contentStore.ReaderAt(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+	defer ra.Close()
+	sr := io.NewSectionReader(ra, 0, desc.Size)
+
+	tmpFile, err := os.CreateTemp("", "tmp.*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmpFile.Name())
+	n, err := io.Copy(tmpFile, sr)
+	if err != nil {
+		return nil, err
+	}
+	if n != desc.Size {
+		return nil, errors.New("the size of the temp file doesn't match that of the layer")
+	}
+
+	toc, err := b.ztocBuilder.BuildZtoc(tmpFile.Name(), b.config.spanSize, ztoc.WithCompression(compressionAlgo))
+	if err != nil {
+		return nil, err
+	}
+
+	// 添加预取文件信息
+	if len(prefetchFiles) > 0 {
+		toc.PrefetchFiles = prefetchFiles
+		fmt.Printf("Added %d prefetch files to layer %s\n", len(prefetchFiles), desc.Digest)
+	}
+
+	ztocReader, ztocDesc, err := ztoc.Marshal(toc)
+	if err != nil {
+		return nil, err
+	}
+
+	err = b.blobStore.Push(ctx, ztocDesc, ztocReader)
+	if err != nil && !store.IsErrAlreadyExists(err) {
+		return nil, fmt.Errorf("cannot push ztoc to local store: %w", err)
+	}
+
+	// write the artifact entry for soci layer
 	entry := &ArtifactEntry{
 		Size:           ztocDesc.Size,
 		Digest:         ztocDesc.Digest.String(),

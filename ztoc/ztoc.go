@@ -58,8 +58,8 @@ type Ztoc struct {
 
 type PrefetchFileInfo struct {
 	Path   string `json:"path"`   // file path
-	Offset int64  `json:"offset"` // offset in the index image
-	Size   int64  `json:"size"`   // file size
+	Size   int64  `json:"size"`   // file size (bytes)
+	Offset int64  `json:"offset"` // file offset in the layer (bytes)
 }
 
 // CompressionInfo is the "zinfo" part of ztoc including the `Checkpoints` data

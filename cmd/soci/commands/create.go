@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/awslabs/soci-snapshotter/cmd/soci/commands/internal"
 	"github.com/awslabs/soci-snapshotter/soci"
@@ -35,6 +36,7 @@ const (
 	spanSizeFlag        = "span-size"
 	minLayerSizeFlag    = "min-layer-size"
 	optimizationFlag    = "optimizations"
+	prefetchFilesFlag   = "prefetch-files"
 	sociIndexGCLabel    = "containerd.io/gc.ref.content.soci-index"
 )
 
@@ -61,6 +63,10 @@ var CreateCommand = &cli.Command{
 		&cli.StringSliceFlag{
 			Name:  optimizationFlag,
 			Usage: fmt.Sprintf("(Experimental) Enable optional optimizations. Valid values are %v", soci.Optimizations),
+		},
+		&cli.StringSliceFlag{
+			Name:  prefetchFilesFlag,
+			Usage: "Comma-separated list of file paths to prefetch. These files will be included in the SOCI index metadata for faster access. Example: --prefetch-files '/app/config.json,/app/static/main.css'",
 		},
 	),
 	Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -118,6 +124,23 @@ var CreateCommand = &cli.Command{
 			soci.WithBuildToolIdentifier(buildToolIdentifier),
 			soci.WithOptimizations(optimizations),
 			soci.WithArtifactsDb(artifactsDb),
+		}
+
+		// 添加预取文件配置
+		prefetchFiles := cmd.StringSlice(prefetchFilesFlag)
+		var allPrefetchFiles []string
+		for _, fileList := range prefetchFiles {
+			// 支持逗号分隔的文件列表
+			files := strings.Split(fileList, ",")
+			for _, file := range files {
+				file = strings.TrimSpace(file)
+				if file != "" {
+					allPrefetchFiles = append(allPrefetchFiles, file)
+				}
+			}
+		}
+		if len(allPrefetchFiles) > 0 {
+			builderOpts = append(builderOpts, soci.WithPrefetchPaths(allPrefetchFiles))
 		}
 
 		builder, err := soci.NewIndexBuilder(cs, blobStore, builderOpts...)
