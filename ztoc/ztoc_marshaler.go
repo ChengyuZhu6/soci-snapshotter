@@ -19,7 +19,6 @@ package ztoc
 import (
 	"archive/tar"
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -424,26 +423,8 @@ func MarshalWithPrefetch(ztoc *Ztoc, layerDigest string) (io.Reader, ocispec.Des
 		return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch metadata: %w", err)
 	}
 
-	// 3. 添加实际的预取文件内容（保持原始路径）
-	for i, fileInfo := range ztoc.PrefetchFiles {
-		if i >= len(ztoc.PrefetchFileContents) {
-			return nil, ocispec.Descriptor{}, fmt.Errorf("missing content for prefetch file %d", i)
-		}
-
-		fileContent := ztoc.PrefetchFileContents[i]
-		fileHeader := &tar.Header{
-			Name:    fileInfo.Path, // 使用原始文件路径
-			Mode:    0644,
-			Size:    int64(len(fileContent)),
-			ModTime: time.Now(),
-		}
-		if err := tarWriter.WriteHeader(fileHeader); err != nil {
-			return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch file header for %s: %w", fileInfo.Path, err)
-		}
-		if _, err := tarWriter.Write(fileContent); err != nil {
-			return nil, ocispec.Descriptor{}, fmt.Errorf("failed to write prefetch file content for %s: %w", fileInfo.Path, err)
-		}
-	}
+	// 注意：不再存储预取文件内容，只存储元数据
+	// 运行时将根据 prefetch.json 中的 span 信息从原始层拉取数据
 
 	// 关闭 tar writer
 	if err := tarWriter.Close(); err != nil {
@@ -457,7 +438,7 @@ func MarshalWithPrefetch(ztoc *Ztoc, layerDigest string) (io.Reader, ocispec.Des
 		Size:   int64(len(tarData)),
 	}
 
-	fmt.Printf("Created tar archive with ztoc.info + prefetch.json + %d prefetch files for layer %s\n",
+	fmt.Printf("Created tar archive with ztoc.info + prefetch.json metadata for %d prefetch files for layer %s\n",
 		len(ztoc.PrefetchFiles), layerDigest)
 
 	return bytes.NewReader(tarData), desc, nil
@@ -493,24 +474,8 @@ func SavePrefetchFiles(ztoc *Ztoc, layerDigest string, baseDir string) error {
 		return fmt.Errorf("failed to write prefetch metadata: %w", err)
 	}
 
-	// 保存每个预取文件的内容
-	for i, fileInfo := range ztoc.PrefetchFiles {
-		if i >= len(ztoc.PrefetchFileContents) {
-			return fmt.Errorf("missing content for prefetch file %d", i)
-		}
-
-		// 使用文件路径的哈希作为文件名，避免路径冲突
-		hasher := sha256.New()
-		hasher.Write([]byte(fileInfo.Path))
-		fileName := fmt.Sprintf("%x", hasher.Sum(nil))
-
-		filePath := filepath.Join(prefetchDir, fileName)
-		if err := os.WriteFile(filePath, ztoc.PrefetchFileContents[i], 0644); err != nil {
-			return fmt.Errorf("failed to write prefetch file %s: %w", fileInfo.Path, err)
-		}
-
-		fmt.Printf("Saved prefetch file %s to %s\n", fileInfo.Path, filePath)
-	}
+	// 注意：不再保存预取文件内容，只保存元数据
+	// 运行时将根据 span 信息从原始层拉取数据
 
 	fmt.Printf("Saved %d prefetch files for layer %s\n", len(ztoc.PrefetchFiles), layerDigest)
 	return nil

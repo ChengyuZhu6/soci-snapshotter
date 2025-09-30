@@ -55,8 +55,7 @@ type Ztoc struct {
 	CompressedArchiveSize   compression.Offset
 	UncompressedArchiveSize compression.Offset
 
-	PrefetchFiles        []PrefetchFileInfo `json:"prefetchFiles,omitempty"`
-	PrefetchFileContents [][]byte           `json:"-"` // 不序列化到 JSON，仅用于内部处理
+	PrefetchFiles []PrefetchFileInfo `json:"prefetchFiles,omitempty"`
 }
 
 type PrefetchFileInfo struct {
